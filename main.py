@@ -5,79 +5,104 @@ from datetime import datetime, timedelta
 
 from utils import tushare_token
 
-# --- 配置区 ---
+# --- Configuration ---
+# PORTFOLIO = {
+#     '沪深300ETF': '000300.SH',
+#     '中证500ETF': '000905.SH',
+#     # '创业板ETF': '399006.SZ',
+#     # '科创50ETF': '000688.SH',
+# }
 PORTFOLIO = {
-    '沪深300ETF': '000300.SH',
-    '中证500ETF': '000905.SH',
-    '创业板ETF': '399006.SZ',
-    '科创50ETF': '000688.SH',
+    'A500ETF': {'指数代码': '000510.SH', 'ETF代码': '512050'},
+    # '创业板50ETF': {'指数代码': '399673.SZ', 'ETF代码': '159949'},
 }
 
-# --- 核心功能函数 ---
+# --- Core Functions ---
 
-# 使用Streamlit的缓存功能，避免重复请求API
-# ttl=3600 表示缓存1小时 (3600秒)，对于周定投来说足够了
+# use st.cache_data to avoid repeated API requests
+# ttl=3600 means cache for 1 hour (3600 seconds), which is sufficient for weekly investment
 @st.cache_data(ttl=3600)
-def get_valuation_data(tushare_token, portfolio, history_years=10):
+def get_valuation_data(token, portfolio):
     """
-    从Tushare获取指数的PE-TTM估值，并计算当前估值在历史数据中的百分位。
+    Fetches PE-TTM and PB valuation data from Tushare for multiple historical periods.
 
     Args:
-        tushare_token (str): 你的Tushare API token.
-        portfolio (dict): 包含ETF名称和对应指数代码的字典.
-        history_years (int): 用于计算估值百分位的历史年限.
+        token (str): Your Tushare API token.
+        portfolio (dict): A dictionary of ETF names and their corresponding index codes.
 
     Returns:
-        pandas.DataFrame: 包含估值数据和百分位的DataFrame.
+        pandas.DataFrame: A DataFrame containing current valuations and historical percentiles.
     """
     try:
-        ts.set_token(tushare_token)
+        ts.set_token(token)
         pro = ts.pro_api()
         
         end_date = datetime.now().strftime('%Y%m%d')
-        start_date = (datetime.now() - timedelta(days=365 * history_years)).strftime('%Y%m%d')
+        # Fetch 10 years of data to cover all required periods
+        start_date = (datetime.now() - timedelta(days=365 * 10)).strftime('%Y%m%d')
 
         results = []
         
-        # 使用st.progress来显示数据加载进度
-        progress_bar = st.progress(0, text="正在初始化...")
+        progress_bar = st.progress(0, text="Initializing...")
         total_indices = len(portfolio)
 
-        for i, (name, code) in enumerate(portfolio.items()):
-            progress_text = f"正在获取 {name} ({code}) 的估值数据..."
+        for i, (name, details) in enumerate(portfolio.items()):
+            index_code = details['指数代码']
+            etf_code = details['ETF代码']
+
+            progress_text = f"Fetching valuation data for {name} ({index_code})..."
             progress_bar.progress((i + 1) / total_indices, text=progress_text)
             
-            # 获取历史估值数据
-            df = pro.index_dailybasic(
-                ts_code=code,
+            # Fetch historical valuation data for both PE and PB
+            df_hist = pro.index_dailybasic(
+                ts_code=index_code,
                 start_date=start_date,
                 end_date=end_date,
-                fields='ts_code,trade_date,pe_ttm'
+                fields='ts_code,trade_date,pe_ttm,pb'
             )
-            
-            # 数据清洗，去除PE为负或空值的情况
-            df = df.dropna(subset=['pe_ttm'])
-            df = df[df['pe_ttm'] > 0]
-            
-            if df.empty:
-                st.warning(f"未能获取到 {name} ({code}) 的有效历史估值数据，已跳过。")
+            df_hist['trade_date'] = pd.to_datetime(df_hist['trade_date'])
+
+            if df_hist.empty:
+                st.warning(f"无法获取有效的历史数据 {name} ({index_code})。跳过该项。")
                 continue
 
-            # 获取最新估值
-            current_pe = df.iloc[0]['pe_ttm']
-            
-            # 计算估值百分位
-            # 百分位 = (历史数据中比当前值小的天数 / 总天数) * 100
-            percentile = (df['pe_ttm'] < current_pe).sum() / len(df) * 100
-            
-            results.append({
+            current_pe = df_hist.iloc[0]['pe_ttm']
+            current_pb = df_hist.iloc[0]['pb']
+
+            item_result = {
                 'ETF名称': name,
-                '跟踪指数': code,
+                '跟踪指数': index_code,
+                '代码': etf_code,
                 '当前PE-TTM': f"{current_pe:.2f}",
-                '估值分位': f"{percentile:.2f}%"
-            })
+                '当前PB': f"{current_pb:.2f}"
+            }
+
+            # Calculate percentiles for 3, 5, and 10-year periods
+            for years in [3, 5, 10]:
+                start_period = datetime.now() - timedelta(days=365 * years)
+                df_period = df_hist[df_hist['trade_date'] >= start_period]
+
+                # Clean PE data and calculate percentile
+                df_pe = df_period.dropna(subset=['pe_ttm'])
+                df_pe = df_pe[df_pe['pe_ttm'] > 0]
+                if not df_pe.empty:
+                    pe_percentile = (df_pe['pe_ttm'] < current_pe).sum() / len(df_pe) * 100
+                    item_result[f'PE分位({years}年)'] = f"{pe_percentile:.2f}%"
+                else:
+                    item_result[f'PE分位({years}年)'] = "N/A"
+
+                # Clean PB data and calculate percentile
+                df_pb = df_period.dropna(subset=['pb'])
+                df_pb = df_pb[df_pb['pb'] > 0]
+                if not df_pb.empty:
+                    pb_percentile = (df_pb['pb'] < current_pb).sum() / len(df_pb) * 100
+                    item_result[f'PB分位({years}年)'] = f"{pb_percentile:.2f}%"
+                else:
+                    item_result[f'PB分位({years}年)'] = "N/A"
+            
+            results.append(item_result)
         
-        progress_bar.empty() # 完成后移除进度条
+        progress_bar.empty()
         return pd.DataFrame(results)
 
     except Exception as e:
@@ -85,37 +110,40 @@ def get_valuation_data(tushare_token, portfolio, history_years=10):
         return pd.DataFrame()
 
 
-def calculate_allocation(total_investment, valuation_data):
+def calculate_allocation(total_investment, valuation_data, selected_percentile_col):
     """
-    根据估值百分位决定投资权重和金额。
+    Calculates investment weight and amount based on the selected valuation percentile.
 
     Args:
-        total_investment (float): 计划投资的总金额.
-        valuation_data (pandas.DataFrame): 包含估值分位的DataFrame.
+        total_investment (float): The total amount to invest.
+        valuation_data (pandas.DataFrame): The DataFrame with valuation percentiles.
+        selected_percentile_col (str): The column name of the chosen percentile for calculation.
 
     Returns:
-        pandas.DataFrame: 包含最终投资建议的DataFrame.
+        pandas.DataFrame: A DataFrame with the final investment advice.
     """
-    if valuation_data.empty:
+    if valuation_data.empty or selected_percentile_col not in valuation_data.columns:
         return pd.DataFrame()
 
-    # --- 投资策略核心 ---
-    # 你可以根据自己的投资哲学，随意修改这里的权重规则
+    # --- Core Investment Strategy ---
+    # You can modify the weighting rules here based on your investment philosophy
     def get_weight(percentile_str):
+        if not isinstance(percentile_str, str) or '%' not in percentile_str:
+            return 0 # Return 0 weight if data is not available
         percentile = float(percentile_str.strip('%'))
         if percentile < 20:
-            return 2.0  # 极度低估，权重x2.0
+            return 2.0  # Extremely undervalued, weight x2.0
         elif 20 <= percentile < 40:
-            return 1.5  # 偏低估，权重x1.5
+            return 1.5  # Undervalued, weight x1.5
         elif 40 <= percentile < 60:
-            return 1.0  # 正常估值，权重x1.0
+            return 1.0  # Fairly valued, weight x1.0
         elif 60 <= percentile < 80:
-            return 0.5  # 偏高估，权重x0.5
+            return 0.5  # Overvalued, weight x0.5
         else:
-            return 0.1  # 极度高估，权重x0.1 (少量持有或不投)
+            return 0.1  # Extremely overvalued, weight x0.1
 
     df = valuation_data.copy()
-    df['投资权重'] = df['估值分位'].apply(get_weight)
+    df['投资权重'] = df[selected_percentile_col].apply(get_weight)
     
     total_weight = df['投资权重'].sum()
     
@@ -124,64 +152,61 @@ def calculate_allocation(total_investment, valuation_data):
         df['建议投资额(元)'] = 0
         return df
 
-    # 根据权重计算每部分的投资额
     df['建议投资额(元)'] = (df['投资权重'] / total_weight * total_investment).round(2)
     
     return df
 
-# --- Streamlit 界面代码 ---
-st.set_page_config(page_title="Jaime's Investment Tool", page_icon="📈")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Jaime's Investment Tool", page_icon="📈", layout="wide")
 st.title("📈 Jaime's Investment Tool")
 st.caption("一个根据指数估值动态计算定投金额的助手")
 
-# 在侧边栏让用户输入Tushare Token
-with st.sidebar:
-    st.header("配置")
-    tushare_token = st.text_input("请输入你的 Tushare Token", type="password")
-    st.markdown("[如何获取Tushare Token?](https://tushare.pro/document/1?doc_id=39)")
-    st.info("你的Token只在本次会话中有效，我们不会存储它。")
+st.subheader("1. 输入本期总投资金额")
+total_investment = st.number_input("计划总投资金额 (CNY)", min_value=0.0, step=100.0, format="%.2f", value=1000.0)
 
-# 主界面
-if not tushare_token:
-    st.warning("👈 请在左侧侧边栏输入你的 Tushare Token 以开始。")
-else:
-    st.subheader("1. 输入本期定投总额")
-    total_investment = st.number_input("计划投资总额(元)", min_value=0.0, step=100.0, format="%.2f")
+if total_investment > 0:
+    valuation_data = get_valuation_data(tushare_token, PORTFOLIO)
 
-    if st.button("🚀 开始计算", use_container_width=True):
-        if total_investment > 0:
-            # 1. 调用函数获取最新的估值数据
-            valuation_data = get_valuation_data(tushare_token, PORTFOLIO)
+    if not valuation_data.empty:
+        st.subheader("2. 最新指数估值概览")
+        # Define the desired column order for the overview table
+        column_order = [
+            'ETF名称', '跟踪指数',
+            '当前PB',
+            'PB分位(3年)', 'PB分位(5年)', 'PB分位(10年)',
+            '当前PE-TTM',
+            'PE分位(3年)', 'PE分位(5年)', 'PE分位(10年)',
+        ]
+        # Filter for columns that actually exist in the dataframe to prevent errors
+        display_columns = [col for col in column_order if col in valuation_data.columns]
+        st.dataframe(valuation_data[display_columns], use_container_width=True, hide_index=True)
 
-            if not valuation_data.empty:
-                st.subheader("2. 最新指数估值概览")
-                st.dataframe(valuation_data, use_container_width=True)
-                
-                # 2. 调用策略函数计算分配额
-                allocation_result = calculate_allocation(total_investment, valuation_data)
+        st.subheader("3. 本周投资建议")
+        col1, col2 = st.columns(2)
+        with col1:
+            valuation_metric = st.selectbox("选择估值指标:", ('PB', 'PE-TTM'))
+        with col2:
+            history_period = st.selectbox("选择参考周期:", ('3年', '5年', '10年'))
 
-                if not allocation_result.empty:
-                    st.subheader("3. 本周投资建议")
-                    st.success("计算完成！请参考以下投资配额：")
-                    
-                    # 格式化输出，让表格更好看
-                    display_df = allocation_result.rename(columns={
-                        '估值分位': '估值分位(PE)',
-                        '建议投资额(元)': '建议投资额'
-                    })
-                    
-                    # 使用st.data_editor来展示，更美观
-                    st.data_editor(
-                        display_df[['ETF名称', '跟踪指数', '估值分位(PE)', '投资权重', '建议投资额']],
-                        use_container_width=True,
-                        disabled=True, # 设置为只读
-                        hide_index=True,
-                    )
+        # Determine the column to use for allocation calculation
+        metric_prefix = 'PE' if valuation_metric == 'PE-TTM' else 'PB'
+        selected_col = f'{metric_prefix}分位({history_period})'
 
-                    # 计算并显示总计
-                    actual_total = allocation_result['建议投资额(元)'].sum()
-                    st.metric(label="合计投资额", value=f"¥ {actual_total:.2f}")
+        allocation_result = calculate_allocation(total_investment, valuation_data, selected_col)
 
-        else:
-            st.warning("请输入一个大于0的投资额。")
+        if not allocation_result.empty:
+            # Format the output for better readability
+            display_df = allocation_result.rename(columns={
+                selected_col: f'参考分位({metric_prefix})',
+                '建议投资额(元)': '建议投资额'
+            })
+            
+            st.data_editor(
+                display_df[['ETF名称', '代码', f'参考分位({metric_prefix})', '投资权重', '建议投资额']],
+                use_container_width=True,
+                disabled=True,
+                hide_index=True,
+            )
 
+            actual_total = allocation_result['建议投资额(元)'].sum()
+            st.metric(label="总投资金额", value=f"¥ {actual_total:.2f}")

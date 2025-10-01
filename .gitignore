@@ -1,1 +1,4 @@
 utils.py
+tmp.*
+*.pyc
+__pycache__/
